@@ -42,7 +42,6 @@ function loadTasks(): Task[] {
       const parsed: unknown = JSON.parse(raw)
       if (
         Array.isArray(parsed) &&
-        parsed.length > 0 &&
         parsed.every(
           (item) =>
             item &&
@@ -414,6 +413,18 @@ export default function App() {
     notify('已清空全部完成进度', 'ok')
   }
 
+  function clearAllTasks() {
+    if (!window.confirm('确定清空所有任务数据吗？所有节点、前置条件与完成进度都会被删除，且不可撤销。')) {
+      return
+    }
+    setTasks([])
+    setSelectedId(null)
+    setDraggingId(null)
+    setDragOverId(null)
+    setDropHint(null)
+    notify('已清空所有任务数据', 'ok')
+  }
+
   function restoreDemo() {
     if (!window.confirm('恢复示例数据会覆盖当前全部任务与进度，确定继续吗？')) {
       return
@@ -711,6 +722,15 @@ export default function App() {
               >
                 一键清空进度
               </button>
+              <button
+                type="button"
+                className="btn danger"
+                onClick={clearAllTasks}
+                disabled={tasks.length === 0}
+                title="删除任务树中的所有节点，不可撤销"
+              >
+                清空所有任务
+              </button>
             </>
           )}
           <button
@@ -749,7 +769,15 @@ export default function App() {
             </span>
           </div>
 
-          <div className="canvas-scroll">
+          <div
+            className="canvas-scroll"
+            onClick={(event) => {
+              // 点击任务节点以外的空白区域时关闭任务详情
+              if (!(event.target as HTMLElement).closest('.task-node')) {
+                setSelectedId(null)
+              }
+            }}
+          >
             <div
               className="canvas"
               style={{ width: layout.width, height: layout.height }}
@@ -761,6 +789,13 @@ export default function App() {
                 }
               }}
             >
+              {tasks.length === 0 && (
+                <div className="canvas-empty">
+                  <div className="canvas-empty-mark" aria-hidden="true">＋</div>
+                  <p>任务树是空的</p>
+                  <span>切换到编辑模式后，点击「+ 新增任务」开始搭建</span>
+                </div>
+              )}
               {dropHint && (
                 <div
                   className={`drop-hint ${dropHint.kind}`}
