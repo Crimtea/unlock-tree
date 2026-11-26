@@ -7,8 +7,10 @@ export interface Task {
   note: string
   requirement: Requirement
   completed: boolean
-  /** 同一依赖层内的固定槽位；槽位可以留空，节点不会自动补位 */
+  /** 同一列内的固定槽位，可为负数；槽位可以留空，节点不会自动补位 */
   slot: number
+  /** 手动指定的展示列，可为负数；未设置时按前置条件的依赖深度自动排列 */
+  column?: number
 }
 
 export interface Point {
@@ -20,6 +22,9 @@ export interface Layout {
   positions: Map<string, Point>
   width: number
   height: number
+  /** 当前布局中最小的展示列 / 槽位，可能为负数 */
+  minColumn: number
+  minSlot: number
 }
 
 export interface Edge {

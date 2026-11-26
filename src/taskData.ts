@@ -115,8 +115,11 @@ export function parseTaskFile(text: string): ParsedTaskFile {
       completed: raw.completed === true,
       slot:
         typeof raw.slot === 'number' && Number.isFinite(raw.slot)
-          ? Math.max(0, Math.floor(raw.slot))
+          ? Math.floor(raw.slot)
           : index,
+      ...(typeof raw.column === 'number' && Number.isFinite(raw.column)
+        ? { column: Math.floor(raw.column) }
+        : {}),
     }
   })
 

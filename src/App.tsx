@@ -1,5 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, DragEvent } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type {
+  ChangeEvent,
+  DragEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react'
 import { createDemoTasks } from './demoData'
 import { parseTaskFile, stringifyExportFile } from './taskData'
 import {
@@ -10,11 +14,13 @@ import {
   PAD,
   completedIdSet,
   describeRequirement,
+  formatLayout,
   getEdges,
   getLayers,
   getLayout,
   getPatterns,
   isRequirementMet,
+  moveToPosition,
   moveToSlot,
   nextSlotInLayer,
   pruneRequirement,
@@ -28,6 +34,11 @@ import './App.css'
 const STORAGE_KEY = 'unlock-tree:tasks'
 const NAME_STORAGE_KEY = 'unlock-tree:name'
 const DEMO_TREE_NAME = '示例数据'
+const MIN_ZOOM = 0.05
+const MAX_ZOOM = 2
+const ZOOM_STEP = 0.1
+/** 画布四周的可平移留白，使空白处也能拖拽移动视图 */
+const CANVAS_MARGIN = 800
 
 function loadTreeName(): string {
   try {
@@ -281,14 +292,139 @@ export default function App() {
   const [dropHint, setDropHint] = useState<{
     x: number
     y: number
-    kind: 'swap' | 'move'
+    kind: 'swap' | 'move' | 'position'
   } | null>(null)
   const [isEditing, setIsEditing] = useState(false)
+  const [zoom, setZoom] = useState(1)
+  const [isPanning, setIsPanning] = useState(false)
   const [toast, setToast] = useState<{
     text: string
     kind: 'ok' | 'warn'
   } | null>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
+  const canvasScrollRef = useRef<HTMLDivElement>(null)
+  const canvasRef = useRef<HTMLDivElement>(null)
+  const zoomRef = useRef(zoom)
+  const pendingScrollRef = useRef<{ left: number; top: number } | null>(null)
+  const panRef = useRef<{
+    pointerId: number
+    startX: number
+    startY: number
+    scrollLeft: number
+    scrollTop: number
+    moved: boolean
+  } | null>(null)
+  const suppressBlankClickRef = useRef(false)
+  const layoutOriginRef = useRef<{ minColumn: number; minSlot: number } | null>(
+    null,
+  )
+
+  function changeZoom(delta: number) {
+    setZoom((prev) =>
+      Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round((prev + delta) * 10) / 10)),
+    )
+  }
+
+  useEffect(() => {
+    zoomRef.current = zoom
+  }, [zoom])
+
+  useEffect(() => {
+    // 初始把视图定位到留白与内容的交界处，四周都留出可平移空间
+    const container = canvasScrollRef.current
+    if (!container) return
+    container.scrollLeft = CANVAS_MARGIN
+    container.scrollTop = CANVAS_MARGIN
+  }, [])
+
+  useEffect(() => {
+    const container = canvasScrollRef.current
+    if (!container) return
+
+    function handleWheel(event: WheelEvent) {
+      if (event.deltaY === 0) return
+      // 滚轮绑定到树图缩放，避免缩放时预览区域自身继续滚动
+      event.preventDefault()
+      const oldZoom = zoomRef.current
+      const direction = event.deltaY > 0 ? -1 : 1
+      const nextZoom = Math.min(
+        MAX_ZOOM,
+        Math.max(MIN_ZOOM, Math.round((oldZoom + direction * ZOOM_STEP) * 10) / 10),
+      )
+      if (nextZoom === oldZoom) return
+
+      // 以光标下的树图位置为锚点：用画布自身坐标，兼容四周留白
+      const scroll = container!
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const ratio = nextZoom / oldZoom
+      pendingScrollRef.current = {
+        left: scroll.scrollLeft + (event.clientX - rect.left) * (ratio - 1),
+        top: scroll.scrollTop + (event.clientY - rect.top) * (ratio - 1),
+      }
+      setZoom(nextZoom)
+    }
+
+    // React 的 onWheel 是被动监听，无法 preventDefault，需原生非被动监听
+    container.addEventListener('wheel', handleWheel, { passive: false })
+    return () => container.removeEventListener('wheel', handleWheel)
+  }, [])
+
+  useLayoutEffect(() => {
+    const scroll = pendingScrollRef.current
+    const container = canvasScrollRef.current
+    if (!scroll || !container) return
+    pendingScrollRef.current = null
+    container.scrollLeft = scroll.left
+    container.scrollTop = scroll.top
+  }, [zoom])
+
+  function handleCanvasPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    suppressBlankClickRef.current = false
+    const target = event.target as HTMLElement
+    // 节点保留点击与拖拽排序，按钮等控件也不参与平移
+    if (target.closest('.task-node, button, input, select, textarea')) return
+
+    const container = event.currentTarget
+    panRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: container.scrollLeft,
+      scrollTop: container.scrollTop,
+      moved: false,
+    }
+    container.setPointerCapture(event.pointerId)
+  }
+
+  function handleCanvasPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const pan = panRef.current
+    if (!pan || pan.pointerId !== event.pointerId) return
+    const dx = event.clientX - pan.startX
+    const dy = event.clientY - pan.startY
+    if (!pan.moved && Math.hypot(dx, dy) < 4) return
+    if (!pan.moved) {
+      pan.moved = true
+      setIsPanning(true)
+    }
+    const container = event.currentTarget
+    container.scrollLeft = pan.scrollLeft - dx
+    container.scrollTop = pan.scrollTop - dy
+  }
+
+  function handleCanvasPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    const pan = panRef.current
+    if (!pan || pan.pointerId !== event.pointerId) return
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    // 平移结束时浏览器仍可能派发 click，不应因此关闭任务详情
+    suppressBlankClickRef.current = pan.moved
+    panRef.current = null
+    setIsPanning(false)
+  }
 
   useEffect(() => {
     try {
@@ -321,6 +457,80 @@ export default function App() {
   const edges = useMemo(() => getEdges(tasks), [tasks])
   const patterns = useMemo(() => getPatterns(tasks), [tasks])
 
+  useLayoutEffect(() => {
+    const previous = layoutOriginRef.current
+    layoutOriginRef.current = {
+      minColumn: layout.minColumn,
+      minSlot: layout.minSlot,
+    }
+    if (!previous) return
+    const dColumn = layout.minColumn - previous.minColumn
+    const dSlot = layout.minSlot - previous.minSlot
+    if (!dColumn && !dSlot) return
+    const container = canvasScrollRef.current
+    if (!container) return
+    // 原点变化会整体平移其他节点，补偿滚动让视觉位置保持不变
+    container.scrollLeft -= dColumn * (NODE_W + GAP_X) * zoom
+    container.scrollTop -= dSlot * (NODE_H + GAP_Y) * zoom
+  }, [layout.minColumn, layout.minSlot, zoom])
+
+  function fitZoom() {
+    const container = canvasScrollRef.current
+    if (!container) return
+
+    // 空树时复位到默认缩放与左上角起点
+    if (tasks.length === 0) {
+      const origin = { left: CANVAS_MARGIN, top: CANVAS_MARGIN }
+      if (zoom === 1) {
+        container.scrollLeft = origin.left
+        container.scrollTop = origin.top
+      } else {
+        pendingScrollRef.current = origin
+        setZoom(1)
+      }
+      return
+    }
+
+    // 以实际节点范围计算，避免空槽或负坐标让整树被无谓缩小
+    const points = [...layout.positions.values()]
+    if (points.length === 0) return
+    const minX = Math.min(...points.map((point) => point.x))
+    const minY = Math.min(...points.map((point) => point.y))
+    const maxX = Math.max(...points.map((point) => point.x + NODE_W))
+    const maxY = Math.max(...points.map((point) => point.y + NODE_H))
+    const contentWidth = maxX - minX
+    const contentHeight = maxY - minY
+
+    // 向下取整，避免四舍五入放大后反而超出可视区域
+    const fitted = Math.min(
+      Math.max(64, container.clientWidth - 32) / contentWidth,
+      Math.max(64, container.clientHeight - 32) / contentHeight,
+      MAX_ZOOM,
+    )
+    // 以 5% 为步进向下取整，低缩放下也能尽量贴近可视区域
+    const nextZoom = Math.max(MIN_ZOOM, Math.floor(fitted * 20) / 20)
+
+    // CSS zoom 会同时缩放画布自身的 left/top 偏移，留白也需乘以缩放比例
+    const origin = CANVAS_MARGIN * nextZoom
+    const scroll = {
+      left:
+        origin +
+        minX * nextZoom +
+        (contentWidth * nextZoom - container.clientWidth) / 2,
+      top:
+        origin +
+        minY * nextZoom +
+        (contentHeight * nextZoom - container.clientHeight) / 2,
+    }
+    if (nextZoom === zoom) {
+      container.scrollLeft = scroll.left
+      container.scrollTop = scroll.top
+    } else {
+      pendingScrollRef.current = scroll
+      setZoom(nextZoom)
+    }
+  }
+
   const selected = selectedId ? (byId.get(selectedId) ?? null) : null
   const selectedLayerIds = useMemo(
     () =>
@@ -337,6 +547,15 @@ export default function App() {
     (task) => !task.completed && isRequirementMet(task.requirement, done),
   ).length
   const lockedCount = tasks.length - doneCount - readyCount
+  // 拖拽时画布可超出当前布局，落点提示框不会被原有边界裁掉
+  const canvasWidth = Math.max(
+    layout.width,
+    dropHint ? dropHint.x + NODE_W + PAD : 0,
+  )
+  const canvasHeight = Math.max(
+    layout.height,
+    dropHint ? dropHint.y + NODE_H + PAD : 0,
+  )
 
   const titleOf = (id: string) => byId.get(id)?.title ?? id
   const notify = (text: string, kind: 'ok' | 'warn' = 'ok') =>
@@ -460,6 +679,20 @@ export default function App() {
     notify('已清空所有任务数据', 'ok')
   }
 
+  function formatTree() {
+    if (tasks.length === 0) return
+    const next = formatLayout(tasks)
+    if (next === tasks) {
+      notify('当前布局已按层级排列', 'ok')
+      return
+    }
+    setTasks(next)
+    setDropHint(null)
+    setDraggingId(null)
+    setDragOverId(null)
+    notify('已按依赖层级从左到右重新排列', 'ok')
+  }
+
   function restoreDemo() {
     if (!window.confirm('恢复示例数据会覆盖当前全部任务与进度，确定继续吗？')) {
       return
@@ -541,33 +774,62 @@ export default function App() {
   }
 
   /**
-   * 固定槽位语义：
-   * - 落在某个节点上 → 与目标交换槽位；
-   * - 落在空白处 → 移到该槽位，原槽位留空，其他节点不动。
+   * 落位语义：
+   * - 同列落在节点上 → 与目标交换槽位；
+   * - 同列落在空白处 → 移到该槽位，原槽位留空，其他节点不动；
+   * - 跨列 → 只改变展示列与槽位，前置条件不变。
    */
   function getDropTarget(
     event: DragEvent<HTMLDivElement>,
     sourceId: string,
   ): {
-    target: { kind: 'swap'; taskId: string } | { kind: 'move'; slot: number }
+    target:
+      | { kind: 'swap'; taskId: string }
+      | { kind: 'move'; slot: number }
+      | { kind: 'position'; column: number; slot: number }
     x: number
     y: number
   } | null {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const mouseX = event.clientX - rect.left
-    const mouseY = event.clientY - rect.top
+    // 以画布为坐标基准：拖到画布下方尚未被槽位占据的空白区也要能落位
+    const rect = canvasRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    // 画布经过缩放，屏幕坐标需换算回未缩放的逻辑坐标
+    const mouseX = (event.clientX - rect.left) / zoom
+    const mouseY = (event.clientY - rect.top) / zoom
     const layers = getLayers(tasks)
+    if (layers.length === 0) return null
 
-    const layerIndex = layers.findIndex((layer) => {
-      const pos = layout.positions.get(layer[0].id)
-      return pos && Math.abs(pos.x + NODE_W / 2 - mouseX) <= (NODE_W + GAP_X) / 2
-    })
-    if (layerIndex < 0) return null
+    const source = byId.get(sourceId)
+    const sourceLayerIndex = layers.findIndex((layer) =>
+      layer.some((task) => task.id === sourceId),
+    )
+    if (!source || sourceLayerIndex < 0) return null
 
-    const layer = layers[layerIndex]
-    if (!layer.some((task) => task.id === sourceId)) return null
-    const sourceSlot = byId.get(sourceId)?.slot ?? 0
+    // 按列几何直接计算目标列：列可能为空，不能依赖 layer[0] 取坐标
+    // 左右都不设限，允许拖到负数列和负槽位，即四周留白区域
+    const columnStep = NODE_W + GAP_X
+    const columnOffset = Math.round(
+      (mouseX - PAD - NODE_W / 2) / columnStep,
+    )
+    const targetColumn = layout.minColumn + columnOffset
 
+    const slotOffset = Math.round(
+      (mouseY - PAD - NODE_H / 2) / (NODE_H + GAP_Y),
+    )
+    const slot = layout.minSlot + slotOffset
+    const x = PAD + columnOffset * columnStep
+    const y = PAD + slotOffset * (NODE_H + GAP_Y)
+
+    if (columnOffset !== sourceLayerIndex) {
+      // 跨列只记录展示位置，前置条件保持不变
+      return {
+        target: { kind: 'position', column: targetColumn, slot },
+        x,
+        y,
+      }
+    }
+
+    const layer = layers[columnOffset] ?? []
     for (const task of layer) {
       if (task.id === sourceId) continue
       const pos = layout.positions.get(task.id)
@@ -586,11 +848,7 @@ export default function App() {
       }
     }
 
-    const slot = Math.max(
-      0,
-      Math.round((mouseY - PAD - NODE_H / 2) / (NODE_H + GAP_Y)),
-    )
-    if (slot === sourceSlot) return null
+    if (slot === source.slot) return null
 
     const occupant = layer.find(
       (task) => task.id !== sourceId && task.slot === slot,
@@ -599,16 +857,12 @@ export default function App() {
       const pos = layout.positions.get(occupant.id)
       return {
         target: { kind: 'swap', taskId: occupant.id },
-        x: pos?.x ?? PAD + layerIndex * (NODE_W + GAP_X),
-        y: pos?.y ?? PAD + slot * (NODE_H + GAP_Y),
+        x: pos?.x ?? x,
+        y: pos?.y ?? y,
       }
     }
 
-    return {
-      target: { kind: 'move', slot },
-      x: PAD + layerIndex * (NODE_W + GAP_X),
-      y: PAD + slot * (NODE_H + GAP_Y),
-    }
+    return { target: { kind: 'move', slot }, x, y }
   }
 
   function handleCanvasDragOver(event: DragEvent<HTMLDivElement>) {
@@ -644,21 +898,28 @@ export default function App() {
     setDropHint(null)
 
     if (!sourceId || !result) {
-      if (sourceId) notify('只能在同一层级内调整上下顺序', 'warn')
+      if (sourceId) notify('无法放置到这里：位置无效', 'warn')
       return
     }
 
+    const target = result.target
     const next =
-      result.target.kind === 'swap'
-        ? swapSlots(tasks, sourceId, result.target.taskId)
-        : moveToSlot(tasks, sourceId, result.target.slot)
-    if (next !== tasks) {
-      setTasks(next)
-      notify(
-        result.target.kind === 'swap' ? '已与目标节点交换位置' : '已移动到空白槽位',
-        'ok',
-      )
-    }
+      target.kind === 'swap'
+        ? swapSlots(tasks, sourceId, target.taskId)
+        : target.kind === 'move'
+          ? moveToSlot(tasks, sourceId, target.slot)
+          : moveToPosition(tasks, sourceId, target.column, target.slot)
+    if (next === tasks) return
+
+    setTasks(next)
+    notify(
+      target.kind === 'swap'
+        ? '已与目标节点交换位置'
+        : target.kind === 'position'
+          ? '已移动到新位置'
+          : '已移动到空白槽位',
+      'ok',
+    )
   }
 
   function handleDragEnd() {
@@ -668,9 +929,8 @@ export default function App() {
   }
 
   function moveSelected(direction: -1 | 1) {
-    if (!selectedId || selectedSlot < 0) return
+    if (!selected || !selectedId) return
     const targetSlot = selectedSlot + direction
-    if (targetSlot < 0) return
     const layer =
       getLayers(tasks).find((group) =>
         group.some((task) => task.id === selectedId),
@@ -749,6 +1009,15 @@ export default function App() {
               <button type="button" className="btn primary" onClick={addTask}>
                 + 新增任务
               </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={formatTree}
+                disabled={tasks.length === 0}
+                title="清除手动位置，按依赖深度从左到右排列，同层保持当前上下顺序"
+              >
+                一键格式化
+              </button>
               <button type="button" className="btn" onClick={restoreDemo}>
                 恢复示例
               </button>
@@ -811,16 +1080,68 @@ export default function App() {
             ) : (
               <h2>{treeName.trim() || '任务树'}</h2>
             )}
-            <span>
+            <span className="panel-hint">
               {isEditing
-                ? '点击节点查看详情 · 拖到节点上交换位置，拖到空白处留空落位 · 箭头为「前置 → 后置」'
-                : '预览模式 · 点击节点查看任务详情，仍可标记完成/撤销；切换到编辑模式后可修改'}
+                ? '点击节点查看详情 · 同列拖动交换/落位，跨列拖动仅改变位置 · 滚轮缩放，拖拽空白处平移'
+                : '预览模式 · 点击节点查看详情 · 滚轮缩放，拖拽空白处平移；切换到编辑模式后可修改'}
             </span>
+            <div className="zoom-controls">
+              <button
+                type="button"
+                title="缩小"
+                aria-label="缩小任务树"
+                disabled={zoom <= MIN_ZOOM}
+                onClick={() => changeZoom(-ZOOM_STEP)}
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className="zoom-level"
+                title="重置为 100%"
+                onClick={() => setZoom(1)}
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                type="button"
+                title="放大"
+                aria-label="放大任务树"
+                disabled={zoom >= MAX_ZOOM}
+                onClick={() => changeZoom(ZOOM_STEP)}
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className="zoom-fit"
+                title="缩放至适合窗口"
+                onClick={fitZoom}
+              >
+                适应
+              </button>
+            </div>
           </div>
 
           <div
-            className="canvas-scroll"
+            ref={canvasScrollRef}
+            className={`canvas-scroll${isPanning ? ' is-panning' : ''}`}
+            onPointerDown={handleCanvasPointerDown}
+            onPointerMove={handleCanvasPointerMove}
+            onPointerUp={handleCanvasPointerEnd}
+            onPointerCancel={handleCanvasPointerEnd}
+            onDragOver={handleCanvasDragOver}
+            onDrop={handleCanvasDrop}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+                setDropHint(null)
+              }
+            }}
             onClick={(event) => {
+              if (suppressBlankClickRef.current) {
+                suppressBlankClickRef.current = false
+                return
+              }
               // 点击任务节点以外的空白区域时关闭任务详情
               if (!(event.target as HTMLElement).closest('.task-node')) {
                 setSelectedId(null)
@@ -828,16 +1149,24 @@ export default function App() {
             }}
           >
             <div
-              className="canvas"
-              style={{ width: layout.width, height: layout.height }}
-              onDragOver={handleCanvasDragOver}
-              onDrop={handleCanvasDrop}
-              onDragLeave={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node)) {
-                  setDropHint(null)
-                }
+              className="canvas-stage"
+              style={{
+                width: canvasWidth + CANVAS_MARGIN * 2,
+                height: canvasHeight + CANVAS_MARGIN * 2,
               }}
             >
+              <div
+                ref={canvasRef}
+                className="canvas"
+                style={{
+                  position: 'absolute',
+                  left: CANVAS_MARGIN,
+                  top: CANVAS_MARGIN,
+                  width: canvasWidth,
+                  height: canvasHeight,
+                  zoom,
+                }}
+              >
               {tasks.length === 0 && (
                 <div className="canvas-empty">
                   <div className="canvas-empty-mark" aria-hidden="true">＋</div>
@@ -855,7 +1184,11 @@ export default function App() {
                     height: NODE_H,
                   }}
                 >
-                  {dropHint.kind === 'swap' ? '交换位置' : '放置在此空位'}
+                  {dropHint.kind === 'swap'
+                    ? '交换位置'
+                    : dropHint.kind === 'position'
+                      ? '移动到此位置'
+                      : '放置在此空位'}
                 </div>
               )}
               <svg
@@ -983,6 +1316,7 @@ export default function App() {
                   </div>
                 )
               })}
+              </div>
             </div>
           </div>
 
@@ -1095,7 +1429,6 @@ export default function App() {
                 <div className="order-buttons">
                   <button
                     type="button"
-                    disabled={selectedSlot <= 0}
                     onClick={() => moveSelected(-1)}
                   >
                     ↑ 上移

@@ -29,7 +29,7 @@ export function pruneRequirement(requirement: Requirement): Requirement {
 export function normalizeSlots(tasks: Task[]): Task[] {
   const result = tasks.map((task) => ({
     ...task,
-    slot: Number.isFinite(task.slot) ? Math.max(0, Math.floor(task.slot)) : 0,
+    slot: Number.isFinite(task.slot) ? Math.floor(task.slot) : 0,
   }))
   let changed = result.some((task, index) => task.slot !== tasks[index].slot)
 
@@ -69,8 +69,63 @@ export function swapSlots(
 /** 把任务移到固定槽位；原槽位留空，其他任务不动 */
 export function moveToSlot(tasks: Task[], taskId: string, slot: number): Task[] {
   const task = tasks.find((item) => item.id === taskId)
-  if (!task || task.slot === slot || slot < 0) return tasks
+  if (!task || task.slot === slot) return tasks
   return tasks.map((item) => (item.id === taskId ? { ...item, slot } : item))
+}
+
+/** 仅改变任务的展示位置（列与槽位），不修改前置条件 */
+export function moveToPosition(
+  tasks: Task[],
+  taskId: string,
+  column: number,
+  slot: number,
+): Task[] {
+  const task = tasks.find((item) => item.id === taskId)
+  if (!task) return tasks
+  const depth = getDependencyDepths(tasks).get(taskId) ?? 0
+  // 拖回自然依赖列时移除覆盖，恢复自动布局
+  const nextColumn = column === depth ? undefined : column
+  if (task.slot === slot && task.column === nextColumn) return tasks
+  return tasks.map((item) => {
+    if (item.id !== taskId) return item
+    const next = { ...item, slot }
+    if (nextColumn === undefined) delete next.column
+    else next.column = nextColumn
+    return next
+  })
+}
+
+/**
+ * 一键整理：清除手动列覆盖，按依赖深度从左到右排列；
+ * 同层节点保持当前上下顺序，槽位重新编号为连续非负整数。
+ */
+export function formatLayout(tasks: Task[]): Task[] {
+  if (tasks.length === 0) return tasks
+  const depths = getDependencyDepths(tasks)
+  const groups = new Map<number, Task[]>()
+  for (const task of tasks) {
+    const depth = depths.get(task.id) ?? 0
+    const group = groups.get(depth) ?? []
+    group.push(task)
+    groups.set(depth, group)
+  }
+
+  const slots = new Map<string, number>()
+  for (const group of groups.values()) {
+    group.sort((a, b) => slotOf(a) - slotOf(b))
+    group.forEach((task, index) => slots.set(task.id, index))
+  }
+
+  const changed = tasks.some(
+    (task) => task.column !== undefined || task.slot !== slots.get(task.id),
+  )
+  if (!changed) return tasks
+
+  return tasks.map((task) => {
+    const next = { ...task, slot: slots.get(task.id) ?? 0 }
+    delete next.column
+    return next
+  })
 }
 
 /** 取某层末尾的新槽位（新增任务时使用） */
@@ -158,8 +213,8 @@ export function describeRequirement(
     .join(' 且 ')
 }
 
-/** 按依赖深度把任务分层，同层内按固定槽位排序（槽位可以留空） */
-export function getLayers(tasks: Task[]): Task[][] {
+/** 按前置条件计算依赖深度，忽略拖动产生的手动列覆盖 */
+export function getDependencyDepths(tasks: Task[]): Map<string, number> {
   const byId = new Map(tasks.map((task) => [task.id, task]))
   const depthCache = new Map<string, number>()
 
@@ -182,38 +237,67 @@ export function getLayers(tasks: Task[]): Task[][] {
   }
 
   for (const task of tasks) depthOf(task.id, new Set())
+  return depthCache
+}
 
+/** 展示列：手动 column 优先（可为负数），否则回退到依赖深度 */
+function columnOf(task: Task, depths: Map<string, number>): number {
+  return typeof task.column === 'number' && Number.isFinite(task.column)
+    ? Math.floor(task.column)
+    : (depths.get(task.id) ?? 0)
+}
+
+function slotOf(task: Task): number {
+  return Number.isFinite(task.slot) ? Math.floor(task.slot) : 0
+}
+
+/** 按展示列分组：数组下标 = 实际列 - 最小列，因此包含负数列 */
+export function getLayers(tasks: Task[]): Task[][] {
+  const depths = getDependencyDepths(tasks)
+  const minColumn = tasks.reduce(
+    (min, task) => Math.min(min, columnOf(task, depths)),
+    0,
+  )
   const layers: Task[][] = []
   for (const task of tasks) {
-    const depth = depthCache.get(task.id) ?? 0
-    while (layers.length <= depth) layers.push([])
-    layers[depth].push(task)
+    const index = columnOf(task, depths) - minColumn
+    while (layers.length <= index) layers.push([])
+    layers[index].push(task)
   }
   for (const layer of layers) layer.sort((a, b) => a.slot - b.slot)
   return layers
 }
 
-/** 按依赖深度分层布局，形成从左到右生长的树状 / 有向无环图 */
+/** 按展示列分层布局，形成从左到右生长的树状 / 有向无环图 */
 export function getLayout(tasks: Task[]): Layout {
-  const layers = getLayers(tasks)
+  const depths = getDependencyDepths(tasks)
+  const minColumn = tasks.reduce(
+    (min, task) => Math.min(min, columnOf(task, depths)),
+    0,
+  )
+  const minSlot = tasks.reduce((min, task) => Math.min(min, slotOf(task)), 0)
+  const maxColumn = tasks.reduce(
+    (max, task) => Math.max(max, columnOf(task, depths)),
+    minColumn,
+  )
+  const maxSlot = tasks.reduce((max, task) => Math.max(max, slotOf(task)), minSlot)
+  const columnCount = tasks.length > 0 ? maxColumn - minColumn + 1 : 0
+  const slotCount = tasks.length > 0 ? maxSlot - minSlot + 1 : 1
+
   const positions = new Map<string, Point>()
-  let maxSlot = 0
-  layers.forEach((layer, depth) => {
-    for (const task of layer) {
-      const slot = Math.max(0, task.slot)
-      maxSlot = Math.max(maxSlot, slot)
-      positions.set(task.id, {
-        x: PAD + depth * (NODE_W + GAP_X),
-        y: PAD + slot * (NODE_H + GAP_Y),
-      })
-    }
-  })
+  for (const task of tasks) {
+    positions.set(task.id, {
+      x: PAD + (columnOf(task, depths) - minColumn) * (NODE_W + GAP_X),
+      y: PAD + (slotOf(task) - minSlot) * (NODE_H + GAP_Y),
+    })
+  }
 
   return {
     positions,
-    width:
-      PAD * 2 + layers.length * NODE_W + Math.max(0, layers.length - 1) * GAP_X,
-    height: PAD * 2 + (maxSlot + 1) * NODE_H + maxSlot * GAP_Y,
+    width: PAD * 2 + columnCount * NODE_W + Math.max(0, columnCount - 1) * GAP_X,
+    height: PAD * 2 + slotCount * NODE_H + Math.max(0, slotCount - 1) * GAP_Y,
+    minColumn,
+    minSlot,
   }
 }
 
