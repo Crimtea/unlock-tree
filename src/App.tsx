@@ -25,7 +25,33 @@ import {
 import type { Requirement, Task } from './types'
 import './App.css'
 
-const STORAGE_KEY = 'task-tree-state-v1'
+const STORAGE_KEY = 'unlock-tree:tasks'
+const NAME_STORAGE_KEY = 'unlock-tree:name'
+const DEMO_TREE_NAME = '示例数据'
+
+function loadTreeName(): string {
+  try {
+    // 从未保存过名称时才使用示例名；用户主动清空名称后保持为空
+    return window.localStorage.getItem(NAME_STORAGE_KEY) ?? DEMO_TREE_NAME
+  } catch {
+    return DEMO_TREE_NAME
+  }
+}
+
+function formatDateStamp(): string {
+  const now = new Date()
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+}
+
+/** 文件名中不允许的字符替换为短横线，避免导出失败 */
+function safeFileNamePart(name: string): string {
+  return name
+    .trim()
+    .slice(0, 60)
+    .replace(/[\\/:*?"<>|]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/, '')
+}
 
 const RULES = [
   { name: '一解锁一', desc: '完成 A → 解锁 B' },
@@ -248,6 +274,7 @@ function RequirementPreview({
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>(loadTasks)
+  const [treeName, setTreeName] = useState(loadTreeName)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dragOverId, setDragOverId] = useState<string | null>(null)
@@ -270,6 +297,14 @@ export default function App() {
       // 存储不可用时忽略
     }
   }, [tasks])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(NAME_STORAGE_KEY, treeName)
+    } catch {
+      // 存储不可用时忽略
+    }
+  }, [treeName])
 
   useEffect(() => {
     if (!toast) return
@@ -430,18 +465,19 @@ export default function App() {
       return
     }
     setTasks(createDemoTasks())
+    setTreeName(DEMO_TREE_NAME)
     setSelectedId(null)
     notify('已恢复示例数据', 'ok')
   }
 
   function exportData() {
-    const blob = new Blob([stringifyExportFile(tasks)], {
+    const blob = new Blob([stringifyExportFile(tasks, treeName)], {
       type: 'application/json;charset=utf-8',
     })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = `task-tree-${new Date().toISOString().slice(0, 10)}.json`
+    link.download = `unlock-tree-${safeFileNamePart(treeName) || '未命名任务树'}-${formatDateStamp()}.json`
     document.body.appendChild(link)
     link.click()
     link.remove()
@@ -462,14 +498,15 @@ export default function App() {
       const imported = parseTaskFile(await file.text())
       if (
         !window.confirm(
-          `将导入 ${imported.length} 个任务并覆盖当前任务与进度，确定继续吗？`,
+          `将导入「${imported.name || '未命名任务树'}」的 ${imported.tasks.length} 个任务并覆盖当前任务与进度，确定继续吗？`,
         )
       ) {
         return
       }
-      setTasks(imported)
+      setTasks(imported.tasks)
+      setTreeName(imported.name)
       setSelectedId(null)
-      notify(`已导入 ${imported.length} 个任务`, 'ok')
+      notify(`已导入 ${imported.tasks.length} 个任务`, 'ok')
     } catch (error) {
       notify(
         `导入失败：${error instanceof Error ? error.message : '文件内容无法识别'}`,
@@ -761,7 +798,19 @@ export default function App() {
       <div className="workspace">
         <section className="canvas-panel">
           <div className="panel-head">
-            <h2>任务树</h2>
+            {isEditing ? (
+              <label className="tree-name-field">
+                <span>任务树名称</span>
+                <input
+                  value={treeName}
+                  maxLength={60}
+                  placeholder="未命名任务树"
+                  onChange={(event) => setTreeName(event.target.value)}
+                />
+              </label>
+            ) : (
+              <h2>{treeName.trim() || '任务树'}</h2>
+            )}
             <span>
               {isEditing
                 ? '点击节点查看详情 · 拖到节点上交换位置，拖到空白处留空落位 · 箭头为「前置 → 后置」'

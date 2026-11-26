@@ -6,20 +6,22 @@ export const EXPORT_VERSION = 1
 export interface TaskFile {
   version: number
   exportedAt: string
+  name: string
   tasks: Task[]
 }
 
-/** 导出内容包含任务定义、前置条件、槽位与完成进度 */
-export function buildExportFile(tasks: Task[]): TaskFile {
+/** 导出内容包含树名称、任务定义、前置条件、槽位与完成进度 */
+export function buildExportFile(tasks: Task[], name = ''): TaskFile {
   return {
     version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
+    name: name.trim().slice(0, 60),
     tasks,
   }
 }
 
-export function stringifyExportFile(tasks: Task[]): string {
-  return JSON.stringify(buildExportFile(tasks), null, 2)
+export function stringifyExportFile(tasks: Task[], name = ''): string {
+  return JSON.stringify(buildExportFile(tasks, name), null, 2)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -58,11 +60,16 @@ function hasCycle(tasks: Task[]): boolean {
   return tasks.some((task) => visit(task.id))
 }
 
+export interface ParsedTaskFile {
+  name: string
+  tasks: Task[]
+}
+
 /**
  * 解析导入的 JSON：既接受本应用导出的文件，也接受纯任务数组。
- * 会清理悬空前置条件、重复 ID 与非法槽位，并校验循环依赖。
+ * 会还原树名称，清理悬空前置条件、重复 ID 与非法槽位，并校验循环依赖。
  */
-export function parseTaskFile(text: string): Task[] {
+export function parseTaskFile(text: string): ParsedTaskFile {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
@@ -75,6 +82,10 @@ export function parseTaskFile(text: string): Task[] {
     : isRecord(parsed)
       ? parsed.tasks
       : null
+  const name =
+    isRecord(parsed) && typeof parsed.name === 'string'
+      ? parsed.name.trim().slice(0, 60)
+      : ''
   if (!Array.isArray(source) || source.length === 0) {
     throw new Error('文件中没有任务数据')
   }
@@ -121,5 +132,5 @@ export function parseTaskFile(text: string): Task[] {
     throw new Error('任务之间存在循环依赖，无法导入')
   }
 
-  return revalidateTasks(sanitized).tasks
+  return { name, tasks: revalidateTasks(sanitized).tasks }
 }
