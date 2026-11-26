@@ -73,6 +73,40 @@ export function moveToSlot(tasks: Task[], taskId: string, slot: number): Task[] 
   return tasks.map((item) => (item.id === taskId ? { ...item, slot } : item))
 }
 
+/** 交换两个任务的展示位置（列与槽位），前置条件与完成状态不变 */
+export function swapPositions(
+  tasks: Task[],
+  firstId: string,
+  secondId: string,
+): Task[] {
+  const first = tasks.find((task) => task.id === firstId)
+  const second = tasks.find((task) => task.id === secondId)
+  if (!first || !second || firstId === secondId) return tasks
+
+  const depths = getDependencyDepths(tasks)
+  const displayColumn = (task: Task) =>
+    typeof task.column === 'number' && Number.isFinite(task.column)
+      ? Math.floor(task.column)
+      : (depths.get(task.id) ?? 0)
+  const firstColumn = displayColumn(first)
+  const secondColumn = displayColumn(second)
+  if (firstColumn === secondColumn && first.slot === second.slot) return tasks
+
+  const apply = (task: Task, column: number, slot: number): Task => {
+    const next = { ...task, slot }
+    // 回到依赖深度对应的列时移除手动覆盖，恢复自动布局
+    if (column === (depths.get(task.id) ?? 0)) delete next.column
+    else next.column = column
+    return next
+  }
+
+  return tasks.map((task) => {
+    if (task.id === firstId) return apply(task, secondColumn, second.slot)
+    if (task.id === secondId) return apply(task, firstColumn, first.slot)
+    return task
+  })
+}
+
 /** 仅改变任务的展示位置（列与槽位），不修改前置条件 */
 export function moveToPosition(
   tasks: Task[],

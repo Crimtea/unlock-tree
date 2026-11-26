@@ -124,12 +124,22 @@ export function parseTaskFile(text: string): ParsedTaskFile {
   })
 
   const validIds = new Set(tasks.map((task) => task.id))
-  const sanitized = tasks.map((task) => ({
-    ...task,
-    requirement: pruneRequirement(
-      task.requirement.map((group) => group.filter((id) => validIds.has(id))),
-    ),
-  }))
+  const sanitized = tasks.map((task) => {
+    // 同一任务在该节点的前置条件中只能出现一次
+    const seen = new Set<string>()
+    return {
+      ...task,
+      requirement: pruneRequirement(
+        task.requirement.map((group) =>
+          group.filter((id) => {
+            if (!validIds.has(id) || seen.has(id)) return false
+            seen.add(id)
+            return true
+          }),
+        ),
+      ),
+    }
+  })
 
   if (hasCycle(sanitized)) {
     throw new Error('任务之间存在循环依赖，无法导入')

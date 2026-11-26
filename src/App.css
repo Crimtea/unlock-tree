@@ -310,6 +310,13 @@
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
 }
 
+.canvas-viewport {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
 .canvas-scroll {
   flex: 1;
   min-height: 0;

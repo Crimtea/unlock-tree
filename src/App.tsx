@@ -25,6 +25,7 @@ import {
   nextSlotInLayer,
   pruneRequirement,
   revalidateTasks,
+  swapPositions,
   swapSlots,
   wouldCreateCycle,
 } from './taskEngine'
@@ -111,14 +112,26 @@ interface RequirementEditorProps {
 }
 
 function RequirementEditor({ task, tasks, onSave }: RequirementEditorProps) {
-  const [draft, setDraft] = useState<Requirement>(() =>
-    task.requirement.map((group) => [...group]),
-  )
+  const [draft, setDraft] = useState<Requirement>(() => {
+    // 同一任务只保留首次出现的条件组，避免历史数据里的重复项
+    const seen = new Set<string>()
+    return task.requirement.map((group) =>
+      group.filter((id) => {
+        if (seen.has(id)) return false
+        seen.add(id)
+        return true
+      }),
+    )
+  })
 
   const titleOf = (id: string) =>
     tasks.find((item) => item.id === id)?.title ?? id
 
+  const usedElsewhere = (index: number, id: string) =>
+    draft.some((group, i) => i !== index && group.includes(id))
+
   const canAdd = (index: number, candidateId: string) => {
+    if (usedElsewhere(index, candidateId)) return false
     const next = draft.map((group, i) =>
       i === index ? [...group, candidateId] : [...group],
     )
@@ -198,7 +211,12 @@ function RequirementEditor({ task, tasks, onSave }: RequirementEditorProps) {
             >
               <option value="">+ 添加前置任务</option>
               {tasks
-                .filter((item) => item.id !== task.id && !group.includes(item.id))
+                .filter(
+                  (item) =>
+                    item.id !== task.id &&
+                    !group.includes(item.id) &&
+                    !usedElsewhere(index, item.id),
+                )
                 .map((item) => {
                   const allowed = canAdd(index, item.id)
                   return (
@@ -301,6 +319,14 @@ export default function App() {
     text: string
     kind: 'ok' | 'warn'
   } | null>(null)
+  // 画布四周留白可动态扩展，拖拽接近边界时继续向该方向增长，形成无限画布
+  const [margins, setMargins] = useState({
+    left: CANVAS_MARGIN,
+    top: CANVAS_MARGIN,
+    right: CANVAS_MARGIN,
+    bottom: CANVAS_MARGIN,
+  })
+  const pendingPanRef = useRef<{ dx: number; dy: number } | null>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
   const canvasScrollRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
@@ -342,9 +368,9 @@ export default function App() {
     if (!container) return
 
     function handleWheel(event: WheelEvent) {
-      if (event.deltaY === 0) return
-      // 滚轮绑定到树图缩放，避免缩放时预览区域自身继续滚动
+      // 滚轮完全绑定为树图缩放：任何方向都阻止预览区自身的默认滚动
       event.preventDefault()
+      if (event.deltaY === 0) return
       const oldZoom = zoomRef.current
       const direction = event.deltaY > 0 ? -1 : 1
       const nextZoom = Math.min(
@@ -353,15 +379,18 @@ export default function App() {
       )
       if (nextZoom === oldZoom) return
 
-      // 以光标下的树图位置为锚点：用画布自身坐标，兼容四周留白
+      // 以光标下的树图位置为锚点。用滚动内容坐标而非画布坐标：
+      // CSS zoom 会同时缩放画布自身的 left/top 留白，用画布坐标会让视图额外跳动
       const scroll = container!
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const rect = canvas.getBoundingClientRect()
+      const rect = scroll.getBoundingClientRect()
       const ratio = nextZoom / oldZoom
       pendingScrollRef.current = {
-        left: scroll.scrollLeft + (event.clientX - rect.left) * (ratio - 1),
-        top: scroll.scrollTop + (event.clientY - rect.top) * (ratio - 1),
+        left:
+          scroll.scrollLeft +
+          (scroll.scrollLeft + event.clientX - rect.left) * (ratio - 1),
+        top:
+          scroll.scrollTop +
+          (scroll.scrollTop + event.clientY - rect.top) * (ratio - 1),
       }
       setZoom(nextZoom)
     }
@@ -379,6 +408,51 @@ export default function App() {
     container.scrollLeft = scroll.left
     container.scrollTop = scroll.top
   }, [zoom])
+
+  // 拖拽接近某侧边界时扩展该侧留白，让视图可以持续向该方向平移
+  function expandCanvasMargin(
+    container: HTMLDivElement,
+    dx: number,
+    dy: number,
+  ) {
+    const threshold = 160
+    const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth)
+    const maxTop = Math.max(0, container.scrollHeight - container.clientHeight)
+    let dl = 0
+    let dr = 0
+    let dt = 0
+    let db = 0
+    if (container.scrollLeft < threshold) dl = CANVAS_MARGIN
+    if (maxLeft - container.scrollLeft < threshold) dr = CANVAS_MARGIN
+    if (container.scrollTop < threshold) dt = CANVAS_MARGIN
+    if (maxTop - container.scrollTop < threshold) db = CANVAS_MARGIN
+    if (!dl && !dr && !dt && !db) return
+
+    // 扩展 left/top 会移动画布（CSS zoom 会缩放该偏移），同步更新拖拽基准
+    const z = zoomRef.current
+    if (panRef.current) {
+      panRef.current.scrollLeft += dl * z
+      panRef.current.scrollTop += dt * z
+    }
+    pendingPanRef.current = { dx, dy }
+    setMargins((prev) => ({
+      left: prev.left + dl,
+      top: prev.top + dt,
+      right: prev.right + dr,
+      bottom: prev.bottom + db,
+    }))
+  }
+
+  useLayoutEffect(() => {
+    const pending = pendingPanRef.current
+    if (!pending || !panRef.current) return
+    pendingPanRef.current = null
+    const container = canvasScrollRef.current
+    if (!container) return
+    // 留白扩展后按新基准重算滚动，避免边界处丢失拖拽距离
+    container.scrollLeft = panRef.current.scrollLeft - pending.dx
+    container.scrollTop = panRef.current.scrollTop - pending.dy
+  }, [margins])
 
   function handleCanvasPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return
@@ -412,6 +486,7 @@ export default function App() {
     const container = event.currentTarget
     container.scrollLeft = pan.scrollLeft - dx
     container.scrollTop = pan.scrollTop - dy
+    expandCanvasMargin(container, dx, dy)
   }
 
   function handleCanvasPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
@@ -480,7 +555,7 @@ export default function App() {
 
     // 空树时复位到默认缩放与左上角起点
     if (tasks.length === 0) {
-      const origin = { left: CANVAS_MARGIN, top: CANVAS_MARGIN }
+      const origin = { left: margins.left, top: margins.top }
       if (zoom === 1) {
         container.scrollLeft = origin.left
         container.scrollTop = origin.top
@@ -511,14 +586,13 @@ export default function App() {
     const nextZoom = Math.max(MIN_ZOOM, Math.floor(fitted * 20) / 20)
 
     // CSS zoom 会同时缩放画布自身的 left/top 偏移，留白也需乘以缩放比例
-    const origin = CANVAS_MARGIN * nextZoom
     const scroll = {
       left:
-        origin +
+        margins.left * nextZoom +
         minX * nextZoom +
         (contentWidth * nextZoom - container.clientWidth) / 2,
       top:
-        origin +
+        margins.top * nextZoom +
         minY * nextZoom +
         (contentHeight * nextZoom - container.clientHeight) / 2,
     }
@@ -528,6 +602,40 @@ export default function App() {
     } else {
       pendingScrollRef.current = scroll
       setZoom(nextZoom)
+    }
+  }
+
+  // 点击百分比：重置为 100%，并按「适应」的方式把整棵树居中（不改变缩放目标）
+  function resetZoom() {
+    const container = canvasScrollRef.current
+    if (!container) {
+      setZoom(1)
+      return
+    }
+    let scroll = { left: margins.left, top: margins.top }
+    const points = [...layout.positions.values()]
+    if (points.length > 0) {
+      const minX = Math.min(...points.map((point) => point.x))
+      const minY = Math.min(...points.map((point) => point.y))
+      const maxX = Math.max(...points.map((point) => point.x + NODE_W))
+      const maxY = Math.max(...points.map((point) => point.y + NODE_H))
+      scroll = {
+        left:
+          margins.left +
+          minX +
+          (maxX - minX - container.clientWidth) / 2,
+        top:
+          margins.top +
+          minY +
+          (maxY - minY - container.clientHeight) / 2,
+      }
+    }
+    if (zoom === 1) {
+      container.scrollLeft = scroll.left
+      container.scrollTop = scroll.top
+    } else {
+      pendingScrollRef.current = scroll
+      setZoom(1)
     }
   }
 
@@ -588,6 +696,11 @@ export default function App() {
 
   function updateRequirement(id: string, requirement: Requirement) {
     const next = pruneRequirement(requirement)
+    const ids = next.flat()
+    if (new Set(ids).size !== ids.length) {
+      notify('同一个任务不能在多个条件组中重复出现', 'warn')
+      return
+    }
     if (wouldCreateCycle(tasks, id, next)) {
       notify('该条件会形成循环依赖，已阻止保存', 'warn')
       return
@@ -607,6 +720,12 @@ export default function App() {
     } else {
       notify('前置条件已保存', 'ok')
     }
+  }
+
+  function handleEmptyClick() {
+    if (!isEditing) setIsEditing(true)
+    setSelectedId(null)
+    addTask()
   }
 
   function addTask() {
@@ -748,12 +867,6 @@ export default function App() {
     }
   }
 
-  function isSameLayer(a: string, b: string) {
-    const from = layout.positions.get(a)
-    const to = layout.positions.get(b)
-    return Boolean(from && to && from.x === to.x)
-  }
-
   function handleDragStart(event: DragEvent<HTMLDivElement>, id: string) {
     event.dataTransfer.effectAllowed = 'move'
     event.dataTransfer.setData('text/plain', id)
@@ -761,10 +874,13 @@ export default function App() {
   }
 
   function handleDragOver(event: DragEvent<HTMLDivElement>, targetId: string) {
+    if (!draggingId || draggingId === targetId) return
+    // 只有真正会交换位置时才高亮目标节点，跨列同样适用
+    const result = getDropTarget(event, draggingId)
     if (
-      !draggingId ||
-      draggingId === targetId ||
-      !isSameLayer(draggingId, targetId)
+      !result ||
+      result.target.kind !== 'swap' ||
+      result.target.taskId !== targetId
     ) {
       return
     }
@@ -777,7 +893,8 @@ export default function App() {
    * 落位语义：
    * - 同列落在节点上 → 与目标交换槽位；
    * - 同列落在空白处 → 移到该槽位，原槽位留空，其他节点不动；
-   * - 跨列 → 只改变展示列与槽位，前置条件不变。
+   * - 跨列落在节点上 → 交换两者的列与槽位；
+   * - 跨列落在空白处 → 只改变展示列与槽位，前置条件不变。
    */
   function getDropTarget(
     event: DragEvent<HTMLDivElement>,
@@ -821,7 +938,20 @@ export default function App() {
     const y = PAD + slotOffset * (NODE_H + GAP_Y)
 
     if (columnOffset !== sourceLayerIndex) {
-      // 跨列只记录展示位置，前置条件保持不变
+      // 跨列落到已有节点上时交换位置，避免两个节点重叠
+      const targetLayer = layers[columnOffset] ?? []
+      const occupant = targetLayer.find(
+        (task) => task.id !== sourceId && task.slot === slot,
+      )
+      if (occupant) {
+        const pos = layout.positions.get(occupant.id)
+        return {
+          target: { kind: 'swap', taskId: occupant.id },
+          x: pos?.x ?? x,
+          y: pos?.y ?? y,
+        }
+      }
+      // 跨列空白槽只记录展示位置，前置条件保持不变
       return {
         target: { kind: 'position', column: targetColumn, slot },
         x,
@@ -905,7 +1035,7 @@ export default function App() {
     const target = result.target
     const next =
       target.kind === 'swap'
-        ? swapSlots(tasks, sourceId, target.taskId)
+        ? swapPositions(tasks, sourceId, target.taskId)
         : target.kind === 'move'
           ? moveToSlot(tasks, sourceId, target.slot)
           : moveToPosition(tasks, sourceId, target.column, target.slot)
@@ -1099,7 +1229,7 @@ export default function App() {
                 type="button"
                 className="zoom-level"
                 title="重置为 100%"
-                onClick={() => setZoom(1)}
+                onClick={resetZoom}
               >
                 {Math.round(zoom * 100)}%
               </button>
@@ -1123,6 +1253,7 @@ export default function App() {
             </div>
           </div>
 
+          <div className="canvas-viewport">
           <div
             ref={canvasScrollRef}
             className={`canvas-scroll${isPanning ? ' is-panning' : ''}`}
@@ -1142,6 +1273,11 @@ export default function App() {
                 suppressBlankClickRef.current = false
                 return
               }
+              // 空树时点击预览区任意位置直接新增起始任务
+              if (tasks.length === 0) {
+                handleEmptyClick()
+                return
+              }
               // 点击任务节点以外的空白区域时关闭任务详情
               if (!(event.target as HTMLElement).closest('.task-node')) {
                 setSelectedId(null)
@@ -1151,8 +1287,8 @@ export default function App() {
             <div
               className="canvas-stage"
               style={{
-                width: canvasWidth + CANVAS_MARGIN * 2,
-                height: canvasHeight + CANVAS_MARGIN * 2,
+                width: canvasWidth + margins.left + margins.right,
+                height: canvasHeight + margins.top + margins.bottom,
               }}
             >
               <div
@@ -1160,20 +1296,13 @@ export default function App() {
                 className="canvas"
                 style={{
                   position: 'absolute',
-                  left: CANVAS_MARGIN,
-                  top: CANVAS_MARGIN,
+                  left: margins.left,
+                  top: margins.top,
                   width: canvasWidth,
                   height: canvasHeight,
                   zoom,
                 }}
               >
-              {tasks.length === 0 && (
-                <div className="canvas-empty">
-                  <div className="canvas-empty-mark" aria-hidden="true">＋</div>
-                  <p>任务树是空的</p>
-                  <span>切换到编辑模式后，点击「+ 新增任务」开始搭建</span>
-                </div>
-              )}
               {dropHint && (
                 <div
                   className={`drop-hint ${dropHint.kind}`}
@@ -1318,6 +1447,14 @@ export default function App() {
               })}
               </div>
             </div>
+          </div>
+          {tasks.length === 0 && (
+            <div className="canvas-empty">
+              <div className="canvas-empty-mark" aria-hidden="true">＋</div>
+              <p>任务树是空的</p>
+              <span>点击此处新增起始任务</span>
+            </div>
+          )}
           </div>
 
           <div className="legend">
